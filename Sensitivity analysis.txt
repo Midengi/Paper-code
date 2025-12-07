@@ -1,0 +1,1527 @@
+"""
+One-shot pipeline + sensitivity analysis for lithium cost–supply model.
+
+Main features
+-------------
+1) Core Monte Carlo pipeline (no plotting):
+   - Takes merged deposit DataFrame or an existing simulation_results_list.
+   - Handles Ore, Brine, Uncon deposits across regions.
+   - Produces a final global AIC-sorted table: `bound_lithium_final`.
+
+2) Sensitivity analysis utilities:
+   - Baseline run from DataFrame.
+   - Triangular Low/High sensitivity.
+   - Generic column-multiplier sensitivity.
+   - Reserve / Recovery / Std joint sweeps.
+   - Capital uplift / std_missing / tail uplift sweeps.
+   - Helpers to combine results (long / wide format).
+   - Export to Excel.
+
+Key conventions
+---------------
+- simulation_results_list: list of simulations;
+  each simulation is a list of dict with keys:
+  ["REG","CTY","Deposit","Types","AISC","S&P","ICPEX","RD"].
+- Types normalized to: "Ore", "Brine", "Uncon".
+- Regions (REG) normalized to upper-case codes:
+  LATAM, NAM, CHN, AUS, EU, AFR, OTH.
+- No plotting functions in this file.
+"""
+
+from __future__ import annotations
+
+from typing import Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
+
+
+# ---------------------------------------------
+# Global constants for capital uplift settings
+# ---------------------------------------------
+
+ORE_REGIONS   = ["LATAM", "NAM", "CHN", "AUS", "EU", "AFR", "OTH"]
+BRINE_REGIONS = ["LATAM", "NAM", "CHN", "OTH"]
+
+ORE_ADJ   = 0.138   # Default capital uplift factor for Ore
+BRINE_ADJ = 0.2135  # Default capital uplift factor for Brine
+UNCON_ADJ = 0.2174  # Default capital uplift factor for Uncon
+
+_TYPE_MAP = {
+    "ore": "Ore",
+    "brine": "Brine",
+    "uncon": "Uncon",
+    "unconventional": "Uncon",
+}
+
+
+# ---------------------------------------------
+# Normalization helpers
+# ---------------------------------------------
+
+def _norm_type(t: str) -> str:
+    """Normalize type string to one of {'Ore','Brine','Uncon'} if possible."""
+    if t is None:
+        return t
+    key = str(t).strip().lower()
+    if key in _TYPE_MAP:
+        return _TYPE_MAP[key]
+    # If already correct, keep it; otherwise title-case as fallback
+    if t in ("Ore", "Brine", "Uncon"):
+        return t
+    return str(t).title()
+
+
+def _norm_reg(r: str) -> str:
+    """Normalize region string to upper-case."""
+    if r is None:
+        return r
+    return str(r).strip().upper()
+
+
+def normalize_sim_results(
+    simulation_results_list: List[List[Dict]],
+) -> List[List[Dict]]:
+    """
+    Normalize REG, Types, S&P in simulation_results_list.
+
+    - REG   -> upper-case
+    - Types -> {'Ore','Brine','Uncon'} (if matched)
+    - S&P   -> upper-case if string
+    """
+    norm_all = []
+    for sim in simulation_results_list:
+        norm_sim = []
+        for entry in sim:
+            e = dict(entry)  # shallow copy
+            e["REG"] = _norm_reg(e.get("REG"))
+            e["Types"] = _norm_type(e.get("Types"))
+            sp = e.get("S&P")
+            if isinstance(sp, str):
+                e["S&P"] = sp.strip().upper()
+            norm_sim.append(e)
+        norm_all.append(norm_sim)
+    return norm_all
+
+
+# ---------------------------------------------
+# Simulation from merged DataFrame
+# ---------------------------------------------
+
+def simulate_from_df(
+    df: pd.DataFrame,
+    n_sims: int = 1000,
+    seed: int = 42,
+    std_multiplier_missing: float = 1.05,
+) -> List[List[Dict]]:
+    """
+    Generate simulation_results_list directly from an already merged df.
+
+    For each simulation:
+      - Draw Coefficient_A from triangular distribution (Low, Median, High).
+      - Inflate Std1 / Std2 by `std_multiplier_missing` if AISC is missing.
+      - Compute RD = Resources * Coefficient_A * ReserveRate * RecoveryRate.
+    """
+    np.random.seed(seed)
+    simulation_results_list: List[List[Dict]] = []
+
+    for sim_id in range(n_sims):
+        simulation_results = []
+        for _, row in df.iterrows():
+            # Safe triangular bounds
+            low = float(row["Low"])
+            mode = float(row["Median"])
+            high = float(row["High"])
+            safe_low = min(low, mode)
+            safe_high = max(high, mode)
+            if safe_high == safe_low:
+                jitter = 1e-9 * max(1.0, abs(mode))
+                safe_low = mode - jitter
+                safe_high = mode + jitter
+
+            Coefficient_A = max(
+                0.0001,
+                np.random.triangular(safe_low, mode, safe_high),
+            )
+
+            production_missing = pd.isna(row["AISC"])
+            std_multiplier = std_multiplier_missing if production_missing else 1.0
+
+            # Reserve / Recovery by type
+            if row["Types"] in ["Ore"]:
+                ReserveRate = max(
+                    0.0001,
+                    np.random.normal(row["ReserveRateO"], row["Std1"] * std_multiplier),
+                )
+                RecoveryRate = max(
+                    0.0001,
+                    np.random.normal(row["RecoveryO"], row["Std2"] * std_multiplier),
+                )
+            else:
+                ReserveRate = max(
+                    0.0001,
+                    np.random.normal(row["ReserveRateB"], row["Std1"] * std_multiplier),
+                )
+                RecoveryRate = max(
+                    0.0001,
+                    np.random.normal(row["RecoveryB"], row["Std2"] * std_multiplier),
+                )
+
+            RD = row["Resources"] * Coefficient_A * ReserveRate * RecoveryRate
+
+            simulation_results.append(
+                {
+                    "REG": row["REG"],
+                    "CTY": row["CTY"],
+                    "Deposit": row["Deposit"],
+                    "Types": row["Types"],
+                    "AISC": row["AISC"],
+                    "S&P": row["S&P"],
+                    "ICPEX": row["ICPEX"],
+                    "RD": RD,
+                }
+            )
+
+        simulation_results_list.append(simulation_results)
+
+    return simulation_results_list
+
+
+# ---------------------------------------------
+# Core helpers: filtering, depletion, AISC
+# ---------------------------------------------
+
+def REG_TYP_SCR(
+    x: List[List[Dict]],
+    y: str,
+    z: str,
+) -> List[List[Dict]]:
+    """
+    Filter simulations by region and type.
+
+    Keep entries with REG == y and Types == z.
+    Assumes normalization has already been applied.
+    """
+    filtered_results = []
+    for sim in x:
+        filtered_sim = [
+            entry for entry in sim
+            if entry.get("REG") == y and entry.get("Types") == z
+        ]
+        filtered_results.append(filtered_sim)
+    return filtered_results
+
+
+def TYPE_ONLY_SCR(x: List[List[Dict]], z: str) -> List[List[Dict]]:
+    """Filter simulations by type only (used for global Uncon bucket)."""
+    filtered_results = []
+    for sim in x:
+        filtered_sim = [entry for entry in sim if entry.get("Types") == z]
+        filtered_results.append(filtered_sim)
+    return filtered_results
+
+
+def Production_SCR(
+    x: List[List[Dict]],
+) -> Tuple[List[List[Dict]], List[List[Dict]]]:
+    """
+    Split simulations into "with AISC" and "without AISC".
+
+    For each simulation:
+      - with AISC: entries where AISC is not NaN.
+      - without AISC: entries where AISC is NaN, sorted by RD descending.
+    """
+    filtered_with_AISC = []
+    filtered_without_AISC = []
+
+    for sim in x:
+        with_aisc = [entry for entry in sim if not pd.isna(entry.get("AISC"))]
+        without_aisc = sorted(
+            [entry for entry in sim if pd.isna(entry.get("AISC"))],
+            key=lambda e: e["RD"],
+            reverse=True,
+        )
+        filtered_with_AISC.append(with_aisc)
+        filtered_without_AISC.append(without_aisc)
+
+    return filtered_with_AISC, filtered_without_AISC
+
+
+def sort_by_AISC(x: List[List[Dict]]) -> List[List[Dict]]:
+    """Sort each simulation by AISC (ascending)."""
+    return [sorted(sim, key=lambda entry: entry["AISC"]) for sim in x]
+
+
+def Depletion_data(
+    x: List[List[Dict]],
+) -> Tuple[pd.DataFrame, np.ndarray, pd.DataFrame]:
+    """
+    Compute depletion (ERM) time series and AISC vector for a set of simulations.
+
+    Returns
+    -------
+    erm_df : DataFrame
+        ERM time series per simulation (rows = steps, columns = Sim_#).
+    aisc_result : np.ndarray
+        AISC values with extra first and last points added.
+    bound_df : DataFrame
+        5th / 50th / 95th percentile ERM across simulations.
+    """
+    erm_results = []
+
+    first_sim = x[0]
+    AISC = np.array([entry["AISC"] for entry in first_sim])
+
+    # Extend AISC at start and end for smooth curve
+    initial_aisc = AISC[0] / 2.0
+    AISC = np.insert(AISC, 0, initial_aisc)
+    final_aisc = AISC[-1] + 0.5 * (AISC[-1] - AISC[-2])
+    aisc_result = np.append(AISC, final_aisc)
+
+    for sim in x:
+        RD = np.array([entry["RD"] for entry in sim])
+        ERM = RD.cumsum() - 0.5 * RD
+        ERM = np.insert(ERM, 0, 0.0)
+        final_erm = RD.sum()
+        ERM = np.append(ERM, final_erm)
+        erm_results.append(ERM)
+
+    erm_df = pd.DataFrame(erm_results).T
+    erm_df.columns = [f"Sim_{i+1}" for i in range(len(x))]
+
+    erm_lower = np.percentile(erm_df, 5, axis=1)
+    erm_med = np.percentile(erm_df, 50, axis=1)
+    erm_upper = np.percentile(erm_df, 95, axis=1)
+
+    bound_df = pd.DataFrame(
+        {
+            "Lower Bound": erm_lower,
+            "Median": erm_med,
+            "Upper Bound": erm_upper,
+        }
+    )
+
+    return erm_df, aisc_result, bound_df
+
+
+def ERM_Prec(x: pd.DataFrame) -> pd.Series:
+    """
+    Convert ERM series to cumulative share in [0,1].
+    """
+    return x["Median"] / x["Median"].iloc[-1]
+
+
+def without_AISC_data(
+    x: List[List[Dict]],
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Compute ERM and ERM bounds for simulations without AISC data.
+    """
+    erm_results = []
+
+    for sim in x:
+        RD = np.array([entry["RD"] for entry in sim])
+        ERM = RD.cumsum() - 0.5 * RD
+        ERM = np.insert(ERM, 0, 0.0)
+        final_erm = RD.sum()
+        ERM = np.append(ERM, final_erm)
+        erm_results.append(ERM)
+
+    erm_df = pd.DataFrame(erm_results).T
+    erm_df.columns = [f"Sim_{i+1}" for i in range(len(x))]
+
+    erm_lower = np.percentile(erm_df, 5, axis=1)
+    erm_med = np.percentile(erm_df, 50, axis=1)
+    erm_upper = np.percentile(erm_df, 95, axis=1)
+
+    bound_df = pd.DataFrame(
+        {
+            "Lower Bound": erm_lower,
+            "Median": erm_med,
+            "Upper Bound": erm_upper,
+        }
+    )
+
+    return erm_df, bound_df
+
+
+def AISC_without(
+    x,
+    y,
+    z,
+    mid: float = 0.5,
+    high: float = 0.8,
+    uplift_mid: float = 0.10,
+    uplift_high: float = 0.20,
+):
+    """
+    Interpolate AISC for deposits without cost data along the depletion curve.
+
+    Inputs
+    ------
+    x : array-like
+        ERM share positions (0..1) for "no-cost" set.
+    y : array-like
+        ERM share positions (0..1) for "with-cost" set.
+    z : array-like
+        AISC array aligned with y (including first/last extension).
+    mid, high : float
+        Tail breakpoints in [0,1].
+    uplift_mid, uplift_high : float
+        Relative uplift for (mid, high] and (high,1] segments.
+
+    Segments
+    --------
+    [0, mid]      : ×1.00
+    (mid, high]   : ×(1 + uplift_mid)
+    (high, 1]     : ×(1 + uplift_high)
+    """
+    x_arr = np.asarray(x, dtype=float)
+    y_arr = np.asarray(y, dtype=float)
+    z_arr = np.asarray(z, dtype=float)
+
+    x_arr = np.clip(x_arr, 0.0, 1.0)
+
+    baseline = np.interp(x_arr, y_arr, z_arr)
+
+    mult = np.ones_like(baseline)
+    mult[(x_arr > mid) & (x_arr <= high)] = 1.0 + uplift_mid
+    mult[x_arr > high] = 1.0 + uplift_high
+
+    adjusted = baseline * mult
+
+    if isinstance(x, pd.Series):
+        return pd.Series(adjusted, index=x.index, name=getattr(x, "name", "AISC_adj"))
+    return adjusted
+
+
+def rd_aisc_sp(
+    x: List[List[Dict]],
+    y: np.ndarray,
+    z: List[List[Dict]],
+    w,
+) -> pd.DataFrame:
+    """
+    Combine with-cost and without-cost RD statistics into a single DataFrame.
+
+    x, y : simulations and AISC values for deposits with AISC.
+           y includes the extra first and last entries.
+    z, w : simulations and interpolated AISC for deposits without AISC.
+           w is aligned with ERM share positions for z.
+    """
+
+    def compute_rd_bounds(
+        data: List[List[Dict]],
+        aisc_values,
+        cost_label: str,
+    ) -> pd.DataFrame:
+        rd_results = [np.array([entry["RD"] for entry in sim]) for sim in data]
+        rd_df = pd.DataFrame(rd_results).T
+        rd_df.columns = [f"Sim_{i+1}" for i in range(len(data))]
+
+        rd_lower = np.percentile(rd_df, 5, axis=1)
+        rd_med = np.percentile(rd_df, 50, axis=1)
+        rd_upper = np.percentile(rd_df, 95, axis=1)
+
+        first = data[0]
+        sp_vals = [entry["S&P"] for entry in first]
+        types = [entry["Types"] for entry in first]
+        regs = [entry["REG"] for entry in first]
+        icpex_vals = [entry.get("ICPEX", np.nan) for entry in first]
+
+        return pd.DataFrame(
+            {
+                "Lower Bound": rd_lower,
+                "Median": rd_med,
+                "Upper Bound": rd_upper,
+                "S&P": sp_vals,
+                "AISC": aisc_values[1:-1],  # drop first and last extension
+                "Cost_information": cost_label,
+                "Types": types,
+                "REG": regs,
+                "ICPEX": icpex_vals,
+            }
+        )
+
+    aisc_with_df = compute_rd_bounds(x, y, "Y")
+    aisc_without_df = compute_rd_bounds(z, w, "N")
+
+    result = pd.concat([aisc_with_df, aisc_without_df], ignore_index=True)
+    result["Cumulative_RD"] = result["Median"].cumsum()
+    return result
+
+
+def sort_allcost(df: pd.DataFrame, y: float) -> pd.DataFrame:
+    """
+    Build AIC column and return DataFrame sorted by AIC (ascending).
+
+    Rules
+    -----
+    - S&P == 'Y'                     → AIC = AISC
+    - S&P == 'N' & ICPEX not NaN     → AIC = AISC + ICPEX
+    - Otherwise                      → AIC = AISC * (1 + y)
+    """
+    df = df.copy()
+
+    cond1 = df["S&P"] == "Y"
+    cond2 = (df["S&P"] == "N") & df["ICPEX"].notna()
+
+    df["AIC"] = np.where(
+        cond1,
+        df["AISC"],
+        np.where(cond2, df["AISC"] + df["ICPEX"], df["AISC"] * (1.0 + y)),
+    )
+
+    out = df.sort_values(by="AIC", ascending=True).reset_index(drop=True)
+    return out
+
+
+def allcost_allhavecost(x: List[List[Dict]]) -> pd.DataFrame:
+    """
+    RD statistics for the special case where every deposit has AISC data.
+    """
+    rd_results = []
+
+    first_sim = x[0]
+    AISC = np.array([entry["AISC"] for entry in first_sim])
+
+    for sim in x:
+        rd = np.array([entry["RD"] for entry in sim])
+        rd_results.append(rd)
+
+    rd_df = pd.DataFrame(rd_results).T
+    rd_df.columns = [f"Sim_{i+1}" for i in range(len(x))]
+
+    rd_lower = np.percentile(rd_df, 5, axis=1)
+    rd_med = np.percentile(rd_df, 50, axis=1)
+    rd_upper = np.percentile(rd_df, 95, axis=1)
+
+    first = x[0]
+    sp_vals = [entry["S&P"] for entry in first]
+    types = [entry["Types"] for entry in first]
+    regs = [entry["REG"] for entry in first]
+    icpex_vals = [entry.get("ICPEX", np.nan) for entry in first]
+
+    allcost_bound_df = pd.DataFrame(
+        {
+            "Lower Bound": rd_lower,
+            "Median": rd_med,
+            "Upper Bound": rd_upper,
+            "AISC": AISC,
+            "S&P": sp_vals,
+            "Types": types,
+            "REG": regs,
+            "Cost_information": "Y",
+            "ICPEX": icpex_vals,
+        }
+    )
+    allcost_bound_df["Cumulative_RD"] = allcost_bound_df["Median"].cumsum()
+    return allcost_bound_df
+
+
+# ---------------------------------------------
+# Region / type workflows (no plotting)
+# ---------------------------------------------
+
+def run_region_type_analysis(
+    simulation_results_list: List[List[Dict]],
+    region: str,
+    typ: str,
+    adjust_factor: float,
+    uplift_mid: float = 0.10,
+    uplift_high: float = 0.20,
+) -> pd.DataFrame:
+    """
+    Mixed workflow for a given (region, type) when some deposits have AISC
+    and some do not.
+    """
+    filtered_simulations = REG_TYP_SCR(simulation_results_list, region, typ)
+    filtered_with_AISC, filtered_without_AISC = Production_SCR(filtered_simulations)
+
+    sorted_AISC_deposit = sort_by_AISC(filtered_with_AISC)
+
+    erm_df, aisc_result, bound_df = Depletion_data(sorted_AISC_deposit)
+    depletion_prec = ERM_Prec(bound_df)
+
+    _, without_bound_df = without_AISC_data(filtered_without_AISC)
+    without_depletion_prec = ERM_Prec(without_bound_df)
+
+    AISC_for_without = AISC_without(
+        without_depletion_prec,
+        depletion_prec,
+        aisc_result,
+        uplift_mid=uplift_mid,
+        uplift_high=uplift_high,
+    )
+
+    AISC_all_bound_df = rd_aisc_sp(
+        sorted_AISC_deposit,
+        aisc_result,
+        filtered_without_AISC,
+        AISC_for_without,
+    )
+
+    allcost_df = sort_allcost(AISC_all_bound_df, adjust_factor)
+    return allcost_df
+
+
+def run_allhavecost_analysis(
+    simulation_results_list: List[List[Dict]],
+    region: str,
+    typ: str,
+    adjust_factor: float,
+) -> pd.DataFrame:
+    """
+    Workflow for (region, type) where all deposits have AISC data.
+    """
+    filtered_simulations = REG_TYP_SCR(simulation_results_list, region, typ)
+    filtered_with_AISC, _ = Production_SCR(filtered_simulations)
+
+    sorted_AISC_deposit = sort_by_AISC(filtered_with_AISC)
+    AISC_all_bound_df = allcost_allhavecost(sorted_AISC_deposit)
+
+    allcost_df = sort_allcost(AISC_all_bound_df, adjust_factor)
+    return allcost_df
+
+
+def run_uncon_global(
+    simulation_results_list: List[List[Dict]],
+    adjust_factor: float,
+    uplift_mid: float = 0.10,
+    uplift_high: float = 0.20,
+) -> pd.DataFrame:
+    """
+    Global workflow for unconventional deposits (Uncon), no region split.
+    """
+    filtered_simulations = TYPE_ONLY_SCR(simulation_results_list, "Uncon")
+    filtered_with_AISC, filtered_without_AISC = Production_SCR(filtered_simulations)
+
+    sorted_AISC_deposit = sort_by_AISC(filtered_with_AISC)
+
+    erm_df, aisc_result, bound_df = Depletion_data(sorted_AISC_deposit)
+    depletion_prec = ERM_Prec(bound_df)
+
+    _, without_bound_df = without_AISC_data(filtered_without_AISC)
+    without_depletion_prec = ERM_Prec(without_bound_df)
+
+    AISC_for_without = AISC_without(
+        without_depletion_prec,
+        depletion_prec,
+        aisc_result,
+        uplift_mid=uplift_mid,
+        uplift_high=uplift_high,
+    )
+
+    AISC_all_bound_df = rd_aisc_sp(
+        sorted_AISC_deposit,
+        aisc_result,
+        filtered_without_AISC,
+        AISC_for_without,
+    )
+
+    allcost_df = sort_allcost(AISC_all_bound_df, adjust_factor)
+    return allcost_df
+
+
+# ---------------------------------------------
+# Global orchestrator
+# ---------------------------------------------
+
+def build_bound_lithium_final(
+    simulation_results_list: List[List[Dict]],
+    *,
+    ore_adj: float = ORE_ADJ,
+    brine_adj: float = BRINE_ADJ,
+    uncon_adj: float = UNCON_ADJ,
+    uplift_mid: float = 0.10,
+    uplift_high: float = 0.20,
+) -> pd.DataFrame:
+    """
+    Main entry point: build global AIC-sorted table from simulation_results_list.
+
+    Steps
+    -----
+    1) Normalize simulation results (REG, Types, S&P).
+    2) For each (Type, Region) combination, run the agreed workflow:
+       Ore:
+         - LATAM, NAM, CHN, AUS, EU, AFR : mixed workflow
+         - OTH                            : all-have-cost workflow
+       Brine:
+         - LATAM, NAM                     : mixed workflow
+         - CHN, OTH                       : all-have-cost workflow
+       Uncon:
+         - Global bucket, mixed workflow
+    3) Concatenate all results.
+    4) Global sort by AIC and recompute global Cumulative_RD.
+    """
+    sims_norm = normalize_sim_results(simulation_results_list)
+
+    out_frames: List[pd.DataFrame] = []
+
+    # Ore
+    for reg in ORE_REGIONS:
+        if reg == "OTH":
+            df_reg = run_allhavecost_analysis(sims_norm, reg, "Ore", ore_adj)
+        else:
+            df_reg = run_region_type_analysis(
+                sims_norm,
+                reg,
+                "Ore",
+                ore_adj,
+                uplift_mid=uplift_mid,
+                uplift_high=uplift_high,
+            )
+        out_frames.append(df_reg)
+
+    # Brine
+    for reg in BRINE_REGIONS:
+        if reg in {"OTH", "CHN"}:
+            df_reg = run_allhavecost_analysis(sims_norm, reg, "Brine", brine_adj)
+        else:
+            df_reg = run_region_type_analysis(
+                sims_norm,
+                reg,
+                "Brine",
+                brine_adj,
+                uplift_mid=uplift_mid,
+                uplift_high=uplift_high,
+            )
+        out_frames.append(df_reg)
+
+    # Uncon (global)
+    df_uncon = run_uncon_global(
+        sims_norm,
+        uncon_adj,
+        uplift_mid=uplift_mid,
+        uplift_high=uplift_high,
+    )
+    out_frames.append(df_uncon)
+
+    # Merge and global sort by AIC
+    bound_lithium_final = pd.concat(out_frames, ignore_index=True)
+    bound_lithium_final = bound_lithium_final.sort_values("AIC", ascending=True).reset_index(drop=True)
+
+    # Global Cumulative_RD
+    bound_lithium_final["Cumulative_RD"] = bound_lithium_final["Median"].cumsum()
+    return bound_lithium_final
+
+
+# ---------------------------------------------
+# Baseline and scenario helpers
+# ---------------------------------------------
+
+def summarize_bound_for_scenario(
+    bound_df: pd.DataFrame,
+    scenario: str = "baseline",
+) -> pd.DataFrame:
+    """
+    Create a compact summary table:
+      [scenario, rank, AIC, Cumulative_RD].
+    """
+    out = bound_df[["AIC", "Cumulative_RD"]].copy().reset_index(drop=True)
+    out.insert(0, "rank", np.arange(1, len(out) + 1))
+    out.insert(0, "scenario", scenario)
+    return out[["scenario", "rank", "AIC", "Cumulative_RD"]]
+
+
+def run_scenario_from_df(
+    df: pd.DataFrame,
+    scenario: str,
+    n_sims: int = 1000,
+    seed: int = 42,
+    std_multiplier_missing: float = 1.05,
+    ore_adj: float = ORE_ADJ,
+    brine_adj: float = BRINE_ADJ,
+    uncon_adj: float = UNCON_ADJ,
+    uplift_mid: float = 0.10,
+    uplift_high: float = 0.20,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    One-shot scenario from DataFrame:
+      df → simulate → build_bound_lithium_final → summary.
+    """
+    sim_results = simulate_from_df(
+        df,
+        n_sims=n_sims,
+        seed=seed,
+        std_multiplier_missing=std_multiplier_missing,
+    )
+    bound = build_bound_lithium_final(
+        sim_results,
+        ore_adj=ore_adj,
+        brine_adj=brine_adj,
+        uncon_adj=uncon_adj,
+        uplift_mid=uplift_mid,
+        uplift_high=uplift_high,
+    )
+
+    bound = bound.sort_values("AIC", ascending=True).reset_index(drop=True)
+    bound["Cumulative_RD"] = bound["Median"].cumsum()
+
+    summary = summarize_bound_for_scenario(bound, scenario=scenario)
+    return bound, summary
+
+
+def build_baseline_from_df(
+    df: pd.DataFrame,
+    n_sims: int = 1000,
+    seed: int = 42,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Convenience function to build baseline results from df.
+    """
+    bound_lithium_final, baseline_summary = run_scenario_from_df(
+        df,
+        scenario="baseline",
+        n_sims=n_sims,
+        seed=seed,
+        std_multiplier_missing=1.05,
+        ore_adj=ORE_ADJ,
+        brine_adj=BRINE_ADJ,
+        uncon_adj=UNCON_ADJ,
+        uplift_mid=0.10,
+        uplift_high=0.20,
+    )
+    return bound_lithium_final, baseline_summary
+
+
+# ---------------------------------------------
+# Sensitivity: triangular Low / High (only)
+# ---------------------------------------------
+
+def run_triangular_low_high_sensitivity_only(
+    df: pd.DataFrame,
+    factors: List[float] | None = None,
+    n_sims: int = 1000,
+    seed: int = 42,
+) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame]:
+    """
+    Triangular Low/High sensitivity without touching baseline.
+
+    For each factor f:
+      - df["Low"]  *= f
+      - df["High"] *= f
+      - run scenario with name: "tri_low_high_x{f:.2f}"
+
+    Returns
+    -------
+    full_tables : dict[scenario_name -> full bound table]
+    sensitivity_summary : DataFrame (long format)
+    """
+    if factors is None:
+        factors = [1.01, 1.05, 1.10, 0.99, 0.95, 0.90]
+
+    full_tables: Dict[str, pd.DataFrame] = {}
+    summaries: List[pd.DataFrame] = []
+
+    for f in factors:
+        df_mod = df.copy()
+        df_mod["Low"] = df_mod["Low"] * f
+        df_mod["High"] = df_mod["High"] * f
+
+        scen = f"tri_low_high_x{f:.2f}"
+        full, summ = run_scenario_from_df(df_mod, scenario=scen, n_sims=n_sims, seed=seed)
+        full_tables[scen] = full
+        summaries.append(summ)
+
+    sensitivity_summary = (
+        pd.concat(summaries, ignore_index=True)
+        if summaries
+        else pd.DataFrame(columns=["scenario", "rank", "AIC", "Cumulative_RD"])
+    )
+    return full_tables, sensitivity_summary
+
+
+# ---------------------------------------------
+# Sensitivity: generic column multiplier
+# ---------------------------------------------
+
+def run_param_sensitivity_only(
+    df: pd.DataFrame,
+    params: List[str],
+    factors: List[float] | None = None,
+    n_sims: int = 1000,
+    seed: int = 42,
+    prefix: str = "param",
+) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame]:
+    """
+    Generic sensitivity: multiply selected columns by factors.
+
+    For each param in `params` and factor f:
+      - df[param] *= f  (if column exists)
+      - run scenario "prefix_param_x{f:.2f}"
+
+    Returns
+    -------
+    full_tables : dict[scenario_name -> full bound table]
+    sensitivity_summary : DataFrame (long format)
+    """
+    if factors is None:
+        factors = [1.01, 1.05, 1.10, 0.99, 0.95, 0.90]
+
+    full_tables: Dict[str, pd.DataFrame] = {}
+    summaries: List[pd.DataFrame] = []
+
+    for p in params:
+        for f in factors:
+            if p not in df.columns:
+                continue
+            df_mod = df.copy()
+            df_mod[p] = df_mod[p] * f
+
+            scen = f"{prefix}_{p}_x{f:.2f}"
+            full, summ = run_scenario_from_df(df_mod, scenario=scen, n_sims=n_sims, seed=seed)
+            full_tables[scen] = full
+            summaries.append(summ)
+
+    sensitivity_summary = (
+        pd.concat(summaries, ignore_index=True)
+        if summaries
+        else pd.DataFrame(columns=["scenario", "rank", "AIC", "Cumulative_RD"])
+    )
+    return full_tables, sensitivity_summary
+
+
+# ---------------------------------------------
+# Sensitivity: reserve / recovery / std (3 lines)
+# ---------------------------------------------
+
+def run_core_rate_std_sensitivity_only(
+    df: pd.DataFrame,
+    factors: List[float] | None = None,
+    n_sims: int = 1000,
+    seed: int = 42,
+) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame]:
+    """
+    Three sensitivity sweeps:
+
+    1) Reserve rates:
+       - ReserveRateO, ReserveRateB scaled by f.
+    2) Recovery rates:
+       - RecoveryO, RecoveryB scaled by f.
+    3) Volatility:
+       - Std1, Std2 scaled by f.
+    """
+    if factors is None:
+        factors = [1.01, 1.05, 1.10, 0.99, 0.95, 0.90]
+
+    full_tables: Dict[str, pd.DataFrame] = {}
+    summaries: List[pd.DataFrame] = []
+
+    def _run(df_mod: pd.DataFrame, scen: str) -> None:
+        full, summ = run_scenario_from_df(df_mod, scenario=scen, n_sims=n_sims, seed=seed)
+        full_tables[scen] = full
+        summaries.append(summ)
+
+    # 1) Reserve rates
+    for f in factors:
+        scen = f"reserve_rate_x{f:.2f}"
+        df_mod = df.copy()
+        if "ReserveRateO" in df_mod.columns:
+            df_mod["ReserveRateO"] *= f
+        if "ReserveRateB" in df_mod.columns:
+            df_mod["ReserveRateB"] *= f
+        _run(df_mod, scen)
+
+    # 2) Recovery rates
+    for f in factors:
+        scen = f"recovery_rate_x{f:.2f}"
+        df_mod = df.copy()
+        if "RecoveryO" in df_mod.columns:
+            df_mod["RecoveryO"] *= f
+        if "RecoveryB" in df_mod.columns:
+            df_mod["RecoveryB"] *= f
+        _run(df_mod, scen)
+
+    # 3) Std1 / Std2
+    for f in factors:
+        scen = f"std12_x{f:.2f}"
+        df_mod = df.copy()
+        if "Std1" in df_mod.columns:
+            df_mod["Std1"] *= f
+        if "Std2" in df_mod.columns:
+            df_mod["Std2"] *= f
+        _run(df_mod, scen)
+
+    sensitivity_summary = pd.concat(summaries, ignore_index=True)
+    return full_tables, sensitivity_summary
+
+
+# ---------------------------------------------
+# Sensitivity: capital / std_missing / tail uplift
+# ---------------------------------------------
+
+def run_capital_uplift_std_sensitivity_only(
+    df: pd.DataFrame,
+    factors: List[float] | None = None,
+    n_sims: int = 1000,
+    seed: int = 42,
+) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame]:
+    """
+    Three sensitivity sweeps:
+
+    1) capital_all:
+       - ore_adj, brine_adj, uncon_adj all scaled by f.
+    2) std_missing:
+       - std_multiplier_missing = 1.05 * f (affects simulation step only).
+    3) tail_uplift:
+       - uplift_mid  = 0.10 * f
+       - uplift_high = 0.20 * f
+    """
+    if factors is None:
+        factors = [1.01, 1.05, 1.10, 0.99, 0.95, 0.90]
+
+    full_tables: Dict[str, pd.DataFrame] = {}
+    summaries: List[pd.DataFrame] = []
+
+    base_ore = ORE_ADJ
+    base_brine = BRINE_ADJ
+    base_uncon = UNCON_ADJ
+    base_mid = 0.10
+    base_high = 0.20
+    base_std = 1.05
+
+    # 1) Capital uplift (ore + brine + uncon)
+    for f in factors:
+        scen = f"capital_all_x{f:.2f}"
+        full, summ = run_scenario_from_df(
+            df,
+            scenario=scen,
+            n_sims=n_sims,
+            seed=seed,
+            std_multiplier_missing=base_std,
+            ore_adj=base_ore * f,
+            brine_adj=base_brine * f,
+            uncon_adj=base_uncon * f,
+            uplift_mid=base_mid,
+            uplift_high=base_high,
+        )
+        full_tables[scen] = full
+        summaries.append(summ)
+
+    # 2) std_multiplier_missing
+    for f in factors:
+        scen = f"std_missing_x{f:.2f}"
+        full, summ = run_scenario_from_df(
+            df,
+            scenario=scen,
+            n_sims=n_sims,
+            seed=seed,
+            std_multiplier_missing=base_std * f,
+            ore_adj=base_ore,
+            brine_adj=base_brine,
+            uncon_adj=base_uncon,
+            uplift_mid=base_mid,
+            uplift_high=base_high,
+        )
+        full_tables[scen] = full
+        summaries.append(summ)
+
+    # 3) Tail uplift (uplift_mid and uplift_high together)
+    for f in factors:
+        scen = f"tail_uplift_x{f:.2f}"
+        full, summ = run_scenario_from_df(
+            df,
+            scenario=scen,
+            n_sims=n_sims,
+            seed=seed,
+            std_multiplier_missing=base_std,
+            ore_adj=base_ore,
+            brine_adj=base_brine,
+            uncon_adj=base_uncon,
+            uplift_mid=base_mid * f,
+            uplift_high=base_high * f,
+        )
+        full_tables[scen] = full
+        summaries.append(summ)
+
+    sensitivity_summary = pd.concat(summaries, ignore_index=True)
+    return full_tables, sensitivity_summary
+
+
+# ---------------------------------------------
+# Combining and exporting summaries
+# ---------------------------------------------
+
+def append_summaries(
+    baseline_summary: pd.DataFrame,
+    *others: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Append one or more scenario summaries to the baseline summary (long format).
+    """
+    parts = [baseline_summary, *others]
+    return pd.concat(parts, ignore_index=True)
+
+
+def merge_summaries_wide(
+    baseline_summary: pd.DataFrame,
+    *others: pd.DataFrame,
+    value_cols: Tuple[str, str] = ("AIC", "Cumulative_RD"),
+    scenario_col: str = "scenario",
+    key_col: str = "rank",
+    flatten: bool = True,
+) -> pd.DataFrame:
+    """
+    Convert one or more long summaries into a wide-format table.
+
+    For each scenario, two columns are added for `value_cols`:
+      e.g., AIC__baseline, Cumulative_RD__baseline, AIC__scenario1, ...
+    """
+    frames = [baseline_summary, *others]
+    frames = [f[[scenario_col, key_col, *value_cols]].copy() for f in frames]
+
+    pivots = []
+    for f in frames:
+        p = f.pivot(index=key_col, columns=scenario_col, values=list(value_cols))
+        pivots.append(p)
+
+    wide = pivots[0]
+    for p in pivots[1:]:
+        wide = wide.join(p, how="outer")
+
+    if flatten:
+        wide.columns = [f"{v}__{s}" for v, s in wide.columns]
+
+    wide = wide.sort_index().reset_index()
+    return wide
+
+
+def save_sensitivity_results_excel(
+    baseline_summary: pd.DataFrame,
+    sensitivity_summaries: Dict[str, pd.DataFrame],
+    path: str = "sensitivity_results.xlsx",
+    include_wide: bool = True,
+) -> str:
+    """
+    Save baseline + multiple sensitivity summaries to an Excel workbook.
+
+    Sheets
+    ------
+    - "baseline_long" : baseline tidy table.
+    - "combined_long" : all scenarios stacked (baseline + all groups).
+    - "long__<key>"   : one sheet per sensitivity group.
+    - "combined_wide" : optional wide-format summary (all groups together).
+    """
+    from pandas import ExcelWriter
+
+    combined_long = append_summaries(baseline_summary, *sensitivity_summaries.values())
+
+    with ExcelWriter(path, engine="xlsxwriter") as writer:
+        baseline_summary.to_excel(writer, sheet_name="baseline_long", index=False)
+        combined_long.to_excel(writer, sheet_name="combined_long", index=False)
+
+        for key, df_sens in sensitivity_summaries.items():
+            df_sens.to_excel(writer, sheet_name=f"long__{key}", index=False)
+
+        if include_wide:
+            wide = merge_summaries_wide(baseline_summary, *sensitivity_summaries.values())
+            wide.to_excel(writer, sheet_name="combined_wide", index=False)
+
+    return path
+
+
+"""
+Plotting utilities for sensitivity analysis figures.
+
+Figures:
+1) ERM sensitivity lines (sheet: PROCESSING)
+2) ERM heatmap (sheet: Heatmap_ERM)
+3) AIC sensitivity lines (sheet: AIC_pro)
+4) AIC heatmap (sheet: Heatmap_AIC)
+"""
+
+import re
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.colors import TwoSlopeNorm
+
+
+# -------------------------------------------------------------------
+# Generic helpers
+# -------------------------------------------------------------------
+
+def _cols_with_suffix(columns, suffix):
+    """Return columns whose name ends with '_{suffix}'."""
+    pat = re.compile(fr"{re.escape('_' + suffix)}$")
+    return [c for c in columns if pat.search(c)]
+
+
+def _pick_extreme_col(df, candidate_cols, suffix, mode="min"):
+    """
+    Pick the column with extreme mean value among candidate columns
+    that share the same suffix.
+    """
+    cols = _cols_with_suffix(candidate_cols, suffix)
+    if not cols:
+        return None
+    means = {c: pd.to_numeric(df[c], errors="coerce").mean() for c in cols}
+    return (min if mode == "min" else max)(means, key=means.get)
+
+
+# -------------------------------------------------------------------
+# 1) ERM sensitivity line plot (sheet: PROCESSING)
+# -------------------------------------------------------------------
+
+def plot_erm_sensitivity_lines(
+    file_path: str,
+    sheet_name: str = "PROCESSING",
+    output_name: str = "ERM_SA.png",
+):
+    """Plot ERM sensitivity curves and save as a PNG."""
+    df = pd.read_excel(file_path, sheet_name=sheet_name)
+
+    y = df.iloc[:, 0]              # AIC (Y axis)
+    all_cols = df.columns[1:]      # ERM columns
+
+    # Decide which columns to keep: ERM + ±1%, ±5%, ±10% extremes
+    keep = []
+    if "ERM" in all_cols:
+        keep.append("ERM")
+
+    neg_suffixes = ["-10%", "-5%", "-1%"]
+    pos_suffixes = ["1%", "5%", "10%"]
+
+    neg_picks = {
+        s: _pick_extreme_col(df, all_cols, s, mode="min") for s in neg_suffixes
+    }
+    pos_picks = {
+        s: _pick_extreme_col(df, all_cols, s, mode="max") for s in pos_suffixes
+    }
+
+    for s in ["-10%", "-5%", "-1%"]:
+        if neg_picks.get(s):
+            keep.append(neg_picks[s])
+    for s in ["1%", "5%", "10%"]:
+        if pos_picks.get(s):
+            keep.append(pos_picks[s])
+
+    # Deduplicate while keeping order
+    seen, ordered = set(), []
+    for c in keep:
+        if c and c not in seen:
+            ordered.append(c)
+            seen.add(c)
+
+    # Plot
+    fig, ax = plt.subplots(figsize=(10.5, 6))
+    line_handles = {}
+
+    for col in ordered:
+        x = pd.to_numeric(df[col], errors="coerce") * 1000
+        (h,) = ax.plot(
+            x,
+            y,
+            label=col,
+            linewidth=2.4 if col == "ERM" else 1.8,
+            alpha=1.0 if col == "ERM" else 0.95,
+            color="black" if col == "ERM" else None,
+        )
+        line_handles[col] = h
+
+    ax.set_xlabel(
+        "Total Lithium Estimated Recoverable Minerals -- Li Thousand Metric Tons",
+        fontsize=12,
+    )
+    ax.set_ylabel("AIC (2023 USD/t LCE)", fontsize=12)
+    ax.grid(True, linestyle="--", alpha=0.6)
+
+    # Legend: row 1 = ERM; row 2 = positive; row 3 = negative
+    first_row_handles = [line_handles["ERM"]] if "ERM" in line_handles else []
+    first_row_labels = ["ERM"] if "ERM" in line_handles else []
+
+    # Positive group
+    pos_order = ["1%", "5%", "10%"]
+    pos_cols = [pos_picks[s] for s in pos_order if pos_picks.get(s)]
+    pos_handles = [line_handles[c] for c in pos_cols]
+    pos_labels = pos_cols[:]
+
+    # Negative group
+    neg_order = ["-1%", "-5%", "-10%"]
+    neg_cols = [neg_picks[s] for s in neg_order if neg_picks.get(s)]
+    neg_handles = [line_handles[c] for c in neg_cols]
+    neg_labels = neg_cols[:]
+
+    if first_row_handles:
+        leg1 = ax.legend(
+            first_row_handles,
+            first_row_labels,
+            loc="upper center",
+            bbox_to_anchor=(0.22, -0.2),
+            ncol=1,
+            frameon=True,
+        )
+        ax.add_artist(leg1)
+
+    if pos_handles:
+        leg2 = ax.legend(
+            pos_handles,
+            pos_labels,
+            loc="upper center",
+            bbox_to_anchor=(0.6, -0.15),
+            ncol=len(pos_handles),
+            frameon=True,
+        )
+        ax.add_artist(leg2)
+
+    if neg_handles:
+        ax.legend(
+            neg_handles,
+            neg_labels,
+            loc="upper center",
+            bbox_to_anchor=(0.6, -0.25),
+            ncol=len(neg_handles),
+            frameon=True,
+        )
+
+    # Layout / axes limits
+    fig.subplots_adjust(bottom=0.38)
+    ax.set_xlim(left=0)
+    ax.set_ylim(bottom=0)
+    ax.margins(x=0, y=0)
+
+    plt.savefig(output_name, dpi=300, bbox_inches="tight")
+    plt.show()
+
+
+# -------------------------------------------------------------------
+# 2) ERM heatmap (sheet: Heatmap_ERM)
+# -------------------------------------------------------------------
+
+def plot_erm_heatmap(
+    file_path: str,
+    sheet_name: str = "Heatmap_ERM",
+    output_name: str = "Heatmap_ERM.png",
+):
+    """Plot ERM heatmap and save as a PNG."""
+    df = pd.read_excel(file_path, sheet_name=sheet_name, index_col=0)
+
+    # Clean index and reindex to fixed order
+    df.index = pd.to_numeric(df.index, errors="coerce")
+    df.index = pd.Index(np.round(df.index.values.astype(float), 4))
+    row_order = [0.10, 0.05, 0.01, 0.00, -0.01, -0.05, -0.10]
+    df = df.reindex(row_order)
+
+    # Color normalization
+    vmin, vmax = np.nanmin(df.values), np.nanmax(df.values)
+    if 0.00 in df.index:
+        vcenter = float(np.nanmedian(df.loc[0.00].values))
+    else:
+        vcenter = float(np.nanmedian(df.values))
+
+    use_two_slope = (vmax > vmin) and (vmin < vcenter < vmax)
+    norm = TwoSlopeNorm(vmin=vmin, vcenter=vcenter, vmax=vmax) if use_two_slope else None
+
+    # Plot
+    fig, ax = plt.subplots(figsize=(7.6, 5.2))
+    im = ax.imshow(df.values, cmap="RdBu_r", norm=norm, aspect="auto")
+
+    ax.set_xticks(range(df.shape[1]))
+    ax.set_xticklabels(df.columns, fontsize=10)
+    ax.set_yticks(range(df.shape[0]))
+    ax.set_yticklabels([f"{int(r*100)}%" for r in row_order], fontsize=10)
+
+    # Grid
+    ax.set_xticks(np.arange(-0.5, df.shape[1], 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, df.shape[0], 1), minor=True)
+    ax.grid(which="minor", color="white", linestyle="-", linewidth=1, alpha=0.7)
+
+    # Cell annotations
+    for i in range(df.shape[0]):
+        for j in range(df.shape[1]):
+            v = df.iat[i, j]
+            if pd.notna(v):
+                ax.text(j, i, f"{v:,.0f}", ha="center", va="center", fontsize=9)
+
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.06)
+    cbar.set_label("ERM (Li Thousand Metric Tons)", fontsize=10)
+
+    ax.set_title("Heatmap — ERM scenarios vs. perturbation levels", fontsize=12)
+    ax.set_xlabel("Variable group")
+    ax.set_ylabel("Perturbation level")
+
+    plt.savefig(output_name, dpi=200, bbox_inches="tight")
+    plt.tight_layout()
+    plt.show()
+
+
+# -------------------------------------------------------------------
+# 3) AIC sensitivity line plot (sheet: AIC_pro)
+# -------------------------------------------------------------------
+
+def plot_aic_sensitivity_lines(
+    file_path: str,
+    sheet_name: str = "AIC_pro",
+    output_name: str = "AIC_SA2.png",
+):
+    """Plot AIC sensitivity curves and save as a PNG."""
+    df = pd.read_excel(file_path, sheet_name=sheet_name)
+
+    # Column 0: ERM (x); column 1: baseline AIC; others: AIC adjustments
+    ERM_col = df.columns[0]
+    AIC_base_col = df.columns[1]
+    adj_cols = df.columns[2:]
+
+    x = pd.to_numeric(df[ERM_col], errors="coerce") * 1000
+
+    # Pick 7 lines: baseline + extremes for ±1%, ±5%, ±10%
+    keep = [AIC_base_col]
+
+    neg_suffixes = ["-10%", "-5%", "-1%"]
+    pos_suffixes = ["1%", "5%", "10%"]
+
+    neg_picks = {
+        s: _pick_extreme_col(df, adj_cols, s, mode="min") for s in neg_suffixes
+    }
+    pos_picks = {
+        s: _pick_extreme_col(df, adj_cols, s, mode="max") for s in pos_suffixes
+    }
+
+    for s in ["-10%", "-5%", "-1%"]:
+        if neg_picks.get(s):
+            keep.append(neg_picks[s])
+    for s in ["1%", "5%", "10%"]:
+        if pos_picks.get(s):
+            keep.append(pos_picks[s])
+
+    # Deduplicate
+    seen, ordered = set(), []
+    for c in keep:
+        if c and c not in seen:
+            ordered.append(c)
+            seen.add(c)
+
+    # Plot
+    fig, ax = plt.subplots(figsize=(10.5, 6))
+    line_handles = {}
+
+    for col in ordered:
+        y = pd.to_numeric(df[col], errors="coerce")
+        (h,) = ax.plot(
+            x,
+            y,
+            label=("AIC" if col == AIC_base_col else col),
+            linewidth=2.4 if col == AIC_base_col else 1.8,
+            alpha=1.0 if col == AIC_base_col else 0.95,
+            color="black" if col == AIC_base_col else None,
+        )
+        line_handles[col] = h
+
+    ax.set_xlabel(
+        "Total Lithium Estimated Recoverable Minerals — Li Thousand Metric Tons",
+        fontsize=12,
+    )
+    ax.set_ylabel("AIC (2023 USD/t LCE)", fontsize=12)
+    ax.grid(True, linestyle="--", alpha=0.6)
+
+    # Legend rows: baseline AIC; positive shocks; negative shocks
+    first_row_handles = [line_handles[AIC_base_col]]
+    first_row_labels = ["AIC"]
+
+    pos_order = ["1%", "5%", "10%"]
+    pos_cols = [pos_picks[s] for s in pos_order if pos_picks.get(s)]
+    pos_handles = [line_handles[c] for c in pos_cols]
+    pos_labels = pos_cols[:]
+
+    neg_order = ["-1%", "-5%", "-10%"]
+    neg_cols = [neg_picks[s] for s in neg_order if neg_picks.get(s)]
+    neg_handles = [line_handles[c] for c in neg_cols]
+    neg_labels = neg_cols[:]
+
+    leg1 = ax.legend(
+        first_row_handles,
+        first_row_labels,
+        loc="upper center",
+        bbox_to_anchor=(0.22, -0.2),
+        ncol=1,
+        frameon=True,
+    )
+    ax.add_artist(leg1)
+
+    if pos_handles:
+        leg2 = ax.legend(
+            pos_handles,
+            pos_labels,
+            loc="upper center",
+            bbox_to_anchor=(0.6, -0.15),
+            ncol=len(pos_handles),
+            frameon=True,
+        )
+        ax.add_artist(leg2)
+
+    if neg_handles:
+        ax.legend(
+            neg_handles,
+            neg_labels,
+            loc="upper center",
+            bbox_to_anchor=(0.6, -0.25),
+            ncol=len(neg_handles),
+            frameon=True,
+        )
+
+    fig.subplots_adjust(bottom=0.38)
+    ax.set_xlim(left=0)
+    ax.set_ylim(bottom=0)
+    ax.margins(x=0, y=0)
+
+    plt.savefig(output_name, dpi=300, bbox_inches="tight")
+    plt.show()
+
+
+# -------------------------------------------------------------------
+# 4) AIC heatmap (sheet: Heatmap_AIC)
+# -------------------------------------------------------------------
+
+def plot_aic_heatmap(
+    file_path: str,
+    sheet_name: str = "Heatmap_AIC",
+    output_name: str = "Heatmap_AIC.png",
+):
+    """Plot AIC heatmap and save as a PNG."""
+    df = pd.read_excel(file_path, sheet_name=sheet_name, index_col=0)
+
+    df.index = pd.to_numeric(df.index, errors="coerce")
+    df.index = pd.Index(np.round(df.index.values.astype(float), 4))
+    row_order = [0.10, 0.05, 0.01, 0.00, -0.01, -0.05, -0.10]
+    df = df.reindex(row_order)
+
+    vmin, vmax = np.nanmin(df.values), np.nanmax(df.values)
+    if 0.00 in df.index:
+        vcenter = float(np.nanmedian(df.loc[0.00].values))
+    else:
+        vcenter = float(np.nanmedian(df.values))
+
+    use_two_slope = (vmax > vmin) and (vmin < vcenter < vmax)
+    norm = TwoSlopeNorm(vmin=vmin, vcenter=vcenter, vmax=vmax) if use_two_slope else None
+
+    fig, ax = plt.subplots(figsize=(7.6, 5.2))
+    im = ax.imshow(df.values, cmap="RdBu_r", norm=norm, aspect="auto")
+
+    ax.set_xticks(range(df.shape[1]))
+    ax.set_xticklabels(df.columns, fontsize=10)
+    ax.set_yticks(range(df.shape[0]))
+    ax.set_yticklabels([f"{int(r*100)}%" for r in row_order], fontsize=10)
+
+    ax.set_xticks(np.arange(-0.5, df.shape[1], 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, df.shape[0], 1), minor=True)
+    ax.grid(which="minor", color="white", linestyle="-", linewidth=1, alpha=0.7)
+
+    for i in range(df.shape[0]):
+        for j in range(df.shape[1]):
+            v = df.iat[i, j]
+            if pd.notna(v):
+                ax.text(j, i, f"{v:,.0f}", ha="center", va="center", fontsize=9)
+
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.06)
+    cbar.set_label("AIC (2023 USD/t LCE)", fontsize=10)
+
+    ax.set_xlabel("Variable group")
+    ax.set_ylabel("Perturbation level")
+
+    plt.savefig(output_name, dpi=200, bbox_inches="tight")
+    plt.tight_layout()
+    plt.show()
+
+
+
