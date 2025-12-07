@@ -1,0 +1,320 @@
+import os
+import warnings
+
+import folium
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import pandas as pd
+from matplotlib.lines import Line2D
+from shapely.geometry import Point
+
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# -------------------------------------------------------------------
+# 0) Paths and basic style
+# -------------------------------------------------------------------
+
+# you own path.
+EXCEL_PATH = r""
+
+# Color mapping: deposit Types -> color
+TYPE_COLOR = {
+    "Brine": "#1f77b4",   # blue
+    "Ore":   "#d62728",   # red
+    "Uncon": "#ffbf00",   # yellow
+}
+
+# Resource size bins and corresponding marker sizes
+SIZE_RULES = [
+    {"label": "0–1", "cond": lambda v: 0 <= v <= 1,  "folium_r": 5,  "mpl_s": 15},
+    {"label": "1–3", "cond": lambda v: 1 < v <= 3,   "folium_r": 8,  "mpl_s": 60},
+    {"label": ">3",  "cond": lambda v: v > 3,        "folium_r": 12, "mpl_s": 160},
+]
+
+
+# -------------------------------------------------------------------
+# 1) Data loading and cleaning
+# -------------------------------------------------------------------
+
+def _standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Standardize column names to: Deposits, Types, Resources, Latitude, Longitude.
+    """
+    col_map = {}
+    for col in df.columns:
+        low = str(col).strip().lower()
+        if low in ["deposit", "deposits", "name"]:
+            col_map[col] = "Deposits"
+        elif low in ["type", "types", "deposit types"]:
+            col_map[col] = "Types"
+        elif low in ["resource", "resources", "reserves"]:
+            col_map[col] = "Resources"
+        elif low in ["lat", "latitude", "y"]:
+            col_map[col] = "Latitude"
+        elif low in ["lon", "long", "longitude", "x"]:
+            col_map[col] = "Longitude"
+
+    df = df.rename(columns=col_map)
+
+    required = ["Deposits", "Types", "Resources", "Latitude", "Longitude"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}. Please check the Excel file.")
+
+    # Convert Resources to numeric and drop invalid rows
+    df["Resources"] = pd.to_numeric(df["Resources"], errors="coerce")
+    df = df.dropna(subset=["Latitude", "Longitude", "Resources"]).copy()
+
+    return df
+
+
+def _classify_size_label(v: float) -> str:
+    """Return the size bin label ('0–1', '1–3', '>3')."""
+    for rule in SIZE_RULES:
+        if rule["cond"](v):
+            return rule["label"]
+    return "0–1"
+
+
+def _size_for_folium(v: float) -> int:
+    """Return marker radius for folium (pixel units)."""
+    for rule in SIZE_RULES:
+        if rule["cond"](v):
+            return rule["folium_r"]
+    return SIZE_RULES[0]["folium_r"]
+
+
+def _size_for_mpl(v: float) -> float:
+    """Return marker size for matplotlib (pt^2)."""
+    for rule in SIZE_RULES:
+        if rule["cond"](v):
+            return rule["mpl_s"]
+    return SIZE_RULES[0]["mpl_s"]
+
+
+def load_and_prepare_data(excel_path: str) -> pd.DataFrame:
+    """
+    Load Excel data, standardize columns, and add size-bin columns.
+    """
+    df = pd.read_excel(excel_path)
+    df = _standardize_columns(df)
+
+    df["size_bin"] = df["Resources"].apply(_classify_size_label)
+    df["folium_r"] = df["Resources"].apply(_size_for_folium)
+    df["mpl_s"] = df["Resources"].apply(_size_for_mpl)
+
+    return df
+
+
+# -------------------------------------------------------------------
+# 2) Folium interactive map
+# -------------------------------------------------------------------
+
+def build_interactive_map(df: pd.DataFrame, html_out: str = "lith_deposits_map.html") -> str:
+    """
+    Build a Folium interactive map and save it as HTML.
+    """
+    center_lat = float(df["Latitude"].mean())
+    center_lon = float(df["Longitude"].mean())
+
+    m = folium.Map(location=[center_lat, center_lon],
+                   zoom_start=6,
+                   tiles="CartoDB positron")
+
+    for _, row in df.iterrows():
+        t = row["Types"]
+        color = TYPE_COLOR.get(t, "#666666")
+        radius = int(row["folium_r"])
+
+        popup_html = folium.Html(
+            f"""
+            <div style="font-size:14px;">
+                <b>{row['Deposits']}</b><br>
+                Type: {row['Types']}<br>
+                Resources: {row['Resources']}<br>
+                Lat/Lon: {row['Latitude']:.5f}, {row['Longitude']:.5f}
+            </div>
+            """,
+            script=True,
+        )
+        popup = folium.Popup(popup_html, max_width=300)
+
+        folium.CircleMarker(
+            location=[row["Latitude"], row["Longitude"]],
+            radius=radius,
+            color=color,
+            weight=1,
+            fill=True,
+            fill_color=color,
+            fill_opacity=0.75,
+            tooltip=row["Deposits"],
+            popup=popup,
+        ).add_to(m)
+
+    # Custom legend (types + size bins)
+    legend_html = """
+    <div style="
+        position: fixed; bottom: 20px; left: 20px; z-index: 9999;
+        background: white; padding: 10px 12px; border: 1px solid #ccc; border-radius: 6px;
+        font-size: 13px; line-height: 1.3;">
+      <div style="font-weight: 600; margin-bottom: 6px;">Legend</div>
+      <div style="margin-bottom: 6px;">
+        <span style="display:inline-block;width:10px;height:10px;background:#1f77b4;border-radius:50%;margin-right:6px;"></span>Brine
+        <span style="display:inline-block;width:10px;height:10px;background:#d62728;border-radius:50%;margin:0 6px 0 12px;"></span>Ore
+        <span style="display:inline-block;width:10px;height:10px;background:#ffbf00;border-radius:50%;margin:0 6px 0 12px;"></span>Uncon
+      </div>
+      <div>
+        <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#888;margin-right:6px;transform:scale(0.9);"></span>0–1
+        <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#888;margin:0 6px 0 20px;transform:scale(1.2);"></span>1–3
+        <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#888;margin:0 6px 0 20px;transform:scale(1.6);"></span>>3
+      </div>
+    </div>
+    """
+    m.get_root().html.add_child(folium.Element(legend_html))
+
+    m.save(html_out)
+    print(f"[OK] Folium map saved to: {os.path.abspath(html_out)}")
+    return html_out
+
+
+# -------------------------------------------------------------------
+# 3) Static PNG map (GeoPandas + matplotlib)
+# -------------------------------------------------------------------
+
+def build_static_map(df: pd.DataFrame, png_out: str = "lith_deposits_map.png") -> str:
+    """
+    Build a static PNG map using GeoPandas + matplotlib.
+    """
+    # Build GeoDataFrame in WGS84
+    gdf = gpd.GeoDataFrame(
+        df.copy(),
+        geometry=[Point(xy) for xy in zip(df["Longitude"], df["Latitude"])],
+        crs="EPSG:4326",
+    )
+
+    # Try to use contextily basemap (optional)
+    use_basemap = False
+    try:
+        import contextily as ctx
+        use_basemap = True
+    except Exception:
+        use_basemap = False
+        ctx = None
+
+    if use_basemap:
+        gdf_plot = gdf.to_crs(3857)  # Web Mercator
+    else:
+        gdf_plot = gdf
+
+    # World boundaries for background
+    world = gpd.read_file(gpd.datasets.get_path("naturalearth_lowres")).to_crs(gdf_plot.crs)
+
+    fig, ax = plt.subplots(figsize=(8.5, 7.5), dpi=150)
+
+    # 1) Country polygons
+    world.plot(ax=ax, facecolor="white", edgecolor="#CCCCCC", linewidth=0.5, zorder=0)
+
+    # 2) Set view limits around data points
+    xmin, ymin, xmax, ymax = gdf_plot.total_bounds
+    dx = (xmax - xmin) * 0.2 if xmax > xmin else 1
+    dy = (ymax - ymin) * 0.2 if ymax > ymin else 1
+    ax.set_xlim(xmin - dx, xmax + dx)
+    ax.set_ylim(ymin - dy, ymax + dy)
+
+    # 3) Add basemap tiles (if available)
+    if use_basemap and ctx is not None:
+        try:
+            ctx.add_basemap(
+                ax,
+                source=ctx.providers.CartoDB.Positron,
+                crs=gdf_plot.crs.to_string(),
+                zorder=1,
+            )
+        except Exception:
+            pass
+
+    # 4) Scatter deposit points by type
+    for t, sub in gdf_plot.groupby("Types"):
+        c = TYPE_COLOR.get(t, "#666666")
+        ax.scatter(
+            sub.geometry.x,
+            sub.geometry.y,
+            s=sub["mpl_s"],
+            edgecolor="#333333",
+            linewidth=0.5,
+            alpha=0.85,
+            c=c,
+            label=t,
+            zorder=5,
+        )
+
+    # Axes and title
+    ax.set_title("Lithium Deposits (Type = Color; Resources = Size)", fontsize=12, pad=10)
+    if not use_basemap:
+        ax.set_xlabel("Longitude")
+        ax.set_ylabel("Latitude")
+    else:
+        ax.set_xlabel("")
+        ax.set_ylabel("")
+
+    # Remove top and right spines
+    for side in ["top", "right"]:
+        ax.spines[side].set_visible(False)
+
+    # Legend: deposit types
+    handles_type = [
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            color="w",
+            markerfacecolor=TYPE_COLOR.get(k, "#666666"),
+            markeredgecolor="#333333",
+            markersize=8,
+            label=k,
+        )
+        for k in TYPE_COLOR.keys()
+    ]
+
+    # Legend: resource size bins
+    size_legend = [("0–1", 15), ("1–3", 60), (">3", 160)]
+    handles_size = [
+        plt.scatter(
+            [],
+            [],
+            s=s,
+            edgecolor="#333333",
+            linewidth=0.5,
+            alpha=0.85,
+            c="#888888",
+            label=l,
+        )
+        for l, s in size_legend
+    ]
+
+    legend1 = ax.legend(handles=handles_type, title="Types", loc="upper left")
+    ax.add_artist(legend1)
+    ax.legend(handles=handles_size, title="Resources", loc="lower left")
+
+    plt.tight_layout()
+    plt.savefig(png_out, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[OK] Static PNG map saved to: {os.path.abspath(png_out)}")
+    return png_out
+
+
+# -------------------------------------------------------------------
+# 4) Main entry point
+# -------------------------------------------------------------------
+
+def main(excel_path: str = EXCEL_PATH):
+    """
+    Load data from Excel and produce both HTML and PNG maps.
+    """
+    df = load_and_prepare_data(excel_path)
+    build_interactive_map(df, html_out="lith_deposits_map.html")
+    build_static_map(df, png_out="lith_deposits_map.png")
+
+
+if __name__ == "__main__":
+    main()
